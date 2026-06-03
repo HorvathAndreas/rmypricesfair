@@ -1,0 +1,17 @@
+# Lokale Konfiguration mit API-Keys - NIEMALS einchecken
+config.yaml
+
+# Interne Notizen - nur lokal
+CLAUDE.md
+.claude/
+
+# venv / Caches
+.venv/
+__pycache__/
+*.pyc
+
+# DB liegt lokal auf dem Pi
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
