@@ -243,6 +243,34 @@ def fetch(base_url: str, *, sitemap_filter: str, product_url_regex: str,
     return records
 
 
+def fetch_one(url: str, *, product_url_regex: str | None = None,
+              **_unused) -> dict | None:
+    """Holt und parst eine einzelne Produktseite (statt eines ganzen Shops).
+    Wird vom interaktiven Tool (coverage.py) genutzt, um manuell hinterlegte
+    URLs aufzuloesen.
+
+    Weitere keyword-Argumente werden ignoriert, damit der gleiche
+    fetcher_config-Dict-Blob aus der DB (z.B. mit 'sitemap_filter') ohne
+    Vorfilterung weitergereicht werden kann.
+    """
+    # Wenn kein Regex mitkommt, faellt variant_ref auf None - der Datensatz
+    # ist trotzdem brauchbar, nur kann der updater ihn spaeter nicht
+    # zuordnen.
+    url_re = re.compile(product_url_regex) if product_url_regex else re.compile(r"(?!x)x")
+    with httpx.Client(
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "de-CH,de;q=0.9",
+        },
+        timeout=TIMEOUT,
+        follow_redirects=True,
+    ) as client:
+        body = _get(client, url)
+        if not body:
+            return None
+        return _parse_product_page(url, body, url_re)
+
+
 # --- CLI ----------------------------------------------------------------------
 
 if __name__ == "__main__":
