@@ -12,13 +12,14 @@ Pro Variante eine Status-Zeile fuer jeden Mitbewerber:
   LUECKE    gar nichts
 
 Aktionen pro Variante:
-  u <n>   URL fuer Mitbewerber Nr. n hinterlegen (manuelles Listing)
-  n <n>   Mitbewerber Nr. n als 'kein Treffer' markieren
-  n       alle LUECKEN der Variante als 'kein Treffer' markieren
-          (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet)
-  s       Skip - naechste Variante
-  q       Quit
-  Enter   naechste Variante
+  u <n>          URL fuer Mitbewerber Nr. n hinterlegen, Prompt fragt URL ab
+  u <n> <URL>    URL direkt mitgeben (Kurzform, kein zweiter Prompt)
+  n <n>          Mitbewerber Nr. n als 'kein Treffer' markieren
+  n              alle LUECKEN der Variante als 'kein Treffer' markieren
+                 (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet)
+  s              Skip - naechste Variante
+  q              Quit
+  Enter          naechste Variante
 
 Manuelles Hinterlegen einer URL ruft den plattform-spezifischen
 'fetch_one'-Helfer auf, parst die Seite, zeigt eine Vorschau und schreibt
@@ -182,18 +183,19 @@ def _ask_url(comp_name: str) -> str | None:
         return s
 
 
-def _link_manual(conn, v, comp) -> bool:
-    """Interaktiver Pfad: URL erfragen, Seite ueber fetch_one parsen,
-    Vorschau zeigen, bei Bestaetigung confirmed=1 Listing + Preis schreiben.
-    Liefert True bei Erfolg."""
+def _link_manual(conn, v, comp, url: str | None = None) -> bool:
+    """Interaktiver Pfad: URL erfragen (oder vom Aufrufer mitgegeben),
+    Seite ueber fetch_one parsen, Vorschau zeigen, bei Bestaetigung
+    confirmed=1 Listing + Preis schreiben. Liefert True bei Erfolg."""
     fetch_one = SINGLE_URL_FETCHERS.get(comp["platform"])
     if fetch_one is None:
         print(f"  -> Plattform '{comp['platform']}' unterstuetzt derzeit kein "
               f"manuelles URL-Hinterlegen ueber dieses Tool.")
         return False
-    url = _ask_url(comp["name"])
-    if not url:
-        return False
+    if url is None:
+        url = _ask_url(comp["name"])
+        if not url:
+            return False
     cfg_raw = comp["fetcher_config"] if "fetcher_config" in comp.keys() else None
     cfg = json.loads(cfg_raw) if cfg_raw else {}
     print(f"  ... lade {url}")
@@ -263,37 +265,67 @@ def _mark_no_match(conn, v, comp) -> None:
 
 # --- Hauptschleife ------------------------------------------------------------
 
-def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None] | None:
-    """Parst 'u 3', 'u3', 'n 2', 'n' (alle Luecken), 's', 'q' usw. Liefert
-    (verb, idx_or_None) oder None bei nicht-erkannter Eingabe.
+def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None, str | None] | None:
+    """Parst die Eingabe und liefert (verb, idx, url) oder None.
+    idx/url sind None, wenn nicht relevant.
 
-    Verb-Codes:
-        'u'      URL hinterlegen fuer Mitbewerber idx
-        'n'      no-match fuer Mitbewerber idx
-        'n_all'  no-match fuer alle LUECKEN dieser Variante
-        'skip'   weiter (Enter oder 's')
-        'quit'   abbrechen
+    Akzeptierte Formen:
+        u <n>            URL spaeter erfragen
+        u <n> <URL>      URL direkt mitgeben (Kurzform)
+        n <n>            no-match fuer Mitbewerber idx
+        n                no-match fuer alle LUECKEN dieser Variante
+        s | <Enter>      weiter zur naechsten Variante
+        q                abbrechen
+
+    Extra-Tokens hinter 'n <n>' werden als Tippfehler abgelehnt (z.B. wenn
+    jemand 'n 1 https://...' tippt, obwohl 'u 1 https://...' gemeint war).
     """
-    raw = raw.strip().lower()
+    raw = raw.strip()
     if not raw:
-        return ("skip", None)
-    if raw == "q":
-        return ("quit", None)
-    if raw == "s":
-        return ("skip", None)
-    if raw == "n":
-        return ("n_all", None)
+        return ("skip", None, None)
+    low = raw.lower()
+    if low == "q":
+        return ("quit", None, None)
+    if low == "s":
+        return ("skip", None, None)
+    if low == "n":
+        return ("n_all", None, None)
+
     parts = raw.split()
-    verb = parts[0][0]
-    arg_str = parts[1] if len(parts) > 1 else parts[0][1:]
-    if verb not in ("u", "n"):
+    first_low = parts[0].lower()
+    if not first_low or first_low[0] not in ("u", "n"):
         return None
-    if not arg_str.isdigit():
+    verb = first_low[0]
+
+    # idx steht entweder direkt am Verb ('u3') oder als naechstes Token ('u 3')
+    if len(first_low) > 1:
+        idx_str = first_low[1:]
+        extras = parts[1:]
+    else:
+        if len(parts) < 2:
+            return None
+        idx_str = parts[1]
+        extras = parts[2:]
+    if not idx_str.isdigit():
         return None
-    idx = int(arg_str)
+    idx = int(idx_str)
     if not (1 <= idx <= n_comps):
         return None
-    return (verb, idx)
+
+    if verb == "n":
+        if extras:
+            return None
+        return ("n", idx, None)
+
+    # verb == 'u': optional URL als zweites Argument
+    if extras:
+        if len(extras) > 1:
+            return None
+        url = extras[0]
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return None
+        return ("u", idx, url)
+    return ("u", idx, None)
 
 
 def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | None) -> None:
@@ -320,16 +352,18 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
         # Pro Variante kann der User mehrere Aktionen ausfuehren, bis er
         # weiter geht (Enter/s/q).
         while True:
-            prompt = ("  u <n> URL | n <n> kein-Treffer | n alle Luecken | "
+            prompt = ("  u <n> [URL] | n <n> kein-Treffer | n alle Luecken | "
                       "s skip | q quit > ")
             raw = _safe_input(prompt)
             if raw is None:
                 return
             parsed = _parse_action(raw, len(comps))
             if parsed is None:
-                print("  -> Eingabe nicht erkannt.")
+                print("  -> Eingabe nicht erkannt. Beispiele: "
+                      "'u 1 https://...', 'u 1' (URL spaeter), 'n 2', "
+                      "'n' (alle Luecken), 's', 'q'.")
                 continue
-            verb, arg = parsed
+            verb, arg, url = parsed
             if verb == "quit":
                 print("\nFortschritt gespeichert. Nochmal coverage.py fuer den Rest.")
                 return
@@ -353,7 +387,7 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
                 continue
             comp = comps[arg - 1]
             if verb == "u":
-                ok = _link_manual(conn, v, comp)
+                ok = _link_manual(conn, v, comp, url)
                 if ok:
                     _reload_for(vkey)
                     # Nach Erfolg Status neu drucken (zeigt MATCH).
