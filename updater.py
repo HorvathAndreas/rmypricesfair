@@ -21,16 +21,21 @@ Aufrufe:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from db import (DEFAULT_DB, get_active_competitors, get_confirmed_listings,
                 get_connection, init_db, update_listing_price)
 
 import woocommerce
+import schema_org
 
-# Plattform -> Fetcher. Vertrag: fetch(base_url) -> list[dict].
+# Plattform -> Fetcher. Vertrag: fetch(base_url, **fetcher_config) ->
+# list[dict]. fetcher_config kommt pro Mitbewerber als JSON aus der DB und
+# wird als kwargs durchgereicht.
 FETCHERS = {
     "woocommerce": woocommerce.fetch,
+    "schema_org": schema_org.fetch,
 }
 
 MAX_CHANGES_PRINTED = 20  # nur die ersten N Preisaenderungen pro Mitbewerber zeigen
@@ -153,8 +158,10 @@ def main(argv: list[str]) -> int:
             print(f"  Plattform '{c['platform']}' nicht unterstuetzt - skip", file=sys.stderr)
             exit_code = 1
             continue
+        cfg_raw = c["fetcher_config"] if "fetcher_config" in c.keys() else None
+        cfg = json.loads(cfg_raw) if cfg_raw else {}
         try:
-            records = fetch(c["base_url"])
+            records = fetch(c["base_url"], **cfg)
         except Exception as e:
             print(f"  Fetch fehlgeschlagen: {e}", file=sys.stderr)
             exit_code = 1

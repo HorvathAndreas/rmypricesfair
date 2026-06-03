@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import sys
 from collections import defaultdict
@@ -34,10 +35,14 @@ from db import (DEFAULT_DB, clear_candidates, get_active_competitors,
                 insert_candidate, upsert_listing)
 
 import woocommerce
+import schema_org
 
-# Plattform -> Fetcher-Funktion. Vertrag: fetch(base_url) -> list[dict].
+# Plattform -> Fetcher-Funktion. Vertrag: fetch(base_url, **fetcher_config) ->
+# list[dict]. Die plattformspezifischen Knoepfe stehen pro Mitbewerber als
+# JSON im DB-Feld 'fetcher_config' und werden als kwargs durchgereicht.
 FETCHERS = {
     "woocommerce": woocommerce.fetch,
+    "schema_org": schema_org.fetch,
 }
 
 # Fuzzy-Parameter
@@ -236,8 +241,10 @@ def main(argv: list[str]) -> int:
             print(f"  Plattform '{c['platform']}' nicht unterstuetzt - skip", file=sys.stderr)
             exit_code = 1
             continue
+        cfg_raw = c["fetcher_config"] if "fetcher_config" in c.keys() else None
+        cfg = json.loads(cfg_raw) if cfg_raw else {}
         try:
-            records = fetch(c["base_url"])
+            records = fetch(c["base_url"], **cfg)
         except Exception as e:
             print(f"  Fetch fehlgeschlagen: {e}", file=sys.stderr)
             exit_code = 1

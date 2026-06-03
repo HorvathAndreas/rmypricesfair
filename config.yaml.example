@@ -1,17 +1,20 @@
 # Konfiguration fuer catalog.py - eigene Shops + API-Keys.
 # Diese Datei nach 'config.yaml' kopieren und Werte einsetzen.
 # 'config.yaml' ist gitignored und gehoert NICHT ins Repo.
+#
+# Pro Shop ein Block. Der Schluessel ist frei waehlbar (hier: Laender-Codes,
+# es koennen auch beliebige Bezeichner sein).
 
 shops:
-  CH:
-    base_url: https://freedive-thurgau.ch
+  shop_a:
+    base_url: https://shop-a.example
     api_key: DEIN_PRESTASHOP_WEBSERVICE_KEY
     currency: CHF          # Waehrung, in der dieser Shop Preise auszeichnet
     country_iso: CH        # ISO-Code des Lieferlandes fuer die MwSt-Berechnung
     is_master: true        # Master-Shop -> Preise landen in my_variant
 
-  DE:
-    base_url: https://freedive-konstanz.de
+  shop_b:
+    base_url: https://shop-b.example
     api_key: DEIN_PRESTASHOP_WEBSERVICE_KEY
     currency: EUR
     country_iso: DE

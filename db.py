@@ -13,6 +13,7 @@ CLI:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -39,12 +40,13 @@ CREATE INDEX IF NOT EXISTS idx_my_variant_ean13     ON my_variant(ean13);
 CREATE INDEX IF NOT EXISTS idx_my_variant_reference ON my_variant(reference);
 
 CREATE TABLE IF NOT EXISTS competitor (
-    competitor_id INTEGER PRIMARY KEY,
-    name          TEXT NOT NULL,
-    base_url      TEXT NOT NULL,
-    platform      TEXT NOT NULL DEFAULT 'shopify',
-    currency      TEXT NOT NULL DEFAULT 'EUR',
-    active        INTEGER NOT NULL DEFAULT 1
+    competitor_id  INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL,
+    base_url       TEXT NOT NULL,
+    platform       TEXT NOT NULL DEFAULT 'shopify',
+    currency       TEXT NOT NULL DEFAULT 'EUR',
+    fetcher_config TEXT,                       -- JSON, plattformspezifische Knoepfe
+    active         INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS listing (
@@ -120,6 +122,11 @@ def get_connection(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     """Legt Schema und Seed-Kurse an. Idempotent - mehrfach aufrufbar."""
     conn.executescript(SCHEMA)
+    # Migration: 'fetcher_config' wurde nach v1 ergaenzt. CREATE TABLE IF NOT
+    # EXISTS aktualisiert keine bestehende Tabelle, daher hier nachziehen.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(competitor)")}
+    if "fetcher_config" not in cols:
+        conn.execute("ALTER TABLE competitor ADD COLUMN fetcher_config TEXT")
     conn.executemany(
         "INSERT OR IGNORE INTO fx_rate (currency, rate_to_chf, updated_at) VALUES (?, ?, ?)",
         SEED_FX,
@@ -179,18 +186,24 @@ def get_active_competitors(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def upsert_competitor(conn: sqlite3.Connection, name: str, base_url: str,
-                      platform: str = "shopify", currency: str = "EUR") -> int:
-    """Legt einen Mitbewerber an (oder aktualisiert per Name) und gibt die competitor_id zurueck."""
+                      platform: str = "shopify", currency: str = "EUR",
+                      fetcher_config: dict | None = None) -> int:
+    """Legt einen Mitbewerber an (oder aktualisiert per Name) und gibt die
+    competitor_id zurueck. 'fetcher_config' wird als JSON gespeichert und
+    spaeter als kwargs an die Fetcher-Funktion durchgereicht."""
+    cfg_json = json.dumps(fetcher_config) if fetcher_config is not None else None
     existing = conn.execute("SELECT competitor_id FROM competitor WHERE name = ?", (name,)).fetchone()
     if existing:
         conn.execute(
-            "UPDATE competitor SET base_url=?, platform=?, currency=? WHERE competitor_id=?",
-            (base_url, platform, currency, existing["competitor_id"]),
+            "UPDATE competitor SET base_url=?, platform=?, currency=?, fetcher_config=? "
+            "WHERE competitor_id=?",
+            (base_url, platform, currency, cfg_json, existing["competitor_id"]),
         )
         return existing["competitor_id"]
     cur = conn.execute(
-        "INSERT INTO competitor (name, base_url, platform, currency) VALUES (?, ?, ?, ?)",
-        (name, base_url, platform, currency),
+        "INSERT INTO competitor (name, base_url, platform, currency, fetcher_config) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (name, base_url, platform, currency, cfg_json),
     )
     return cur.lastrowid
 
