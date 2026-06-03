@@ -14,6 +14,8 @@ Pro Variante eine Status-Zeile fuer jeden Mitbewerber:
 Aktionen pro Variante:
   u <n>   URL fuer Mitbewerber Nr. n hinterlegen (manuelles Listing)
   n <n>   Mitbewerber Nr. n als 'kein Treffer' markieren
+  n       alle LUECKEN der Variante als 'kein Treffer' markieren
+          (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet)
   s       Skip - naechste Variante
   q       Quit
   Enter   naechste Variante
@@ -262,8 +264,16 @@ def _mark_no_match(conn, v, comp) -> None:
 # --- Hauptschleife ------------------------------------------------------------
 
 def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None] | None:
-    """Parst 'u 3', 'u3', 'n 2', 's', 'q' usw. Liefert (verb, idx_or_None)
-    oder None bei nicht-erkannter Eingabe."""
+    """Parst 'u 3', 'u3', 'n 2', 'n' (alle Luecken), 's', 'q' usw. Liefert
+    (verb, idx_or_None) oder None bei nicht-erkannter Eingabe.
+
+    Verb-Codes:
+        'u'      URL hinterlegen fuer Mitbewerber idx
+        'n'      no-match fuer Mitbewerber idx
+        'n_all'  no-match fuer alle LUECKEN dieser Variante
+        'skip'   weiter (Enter oder 's')
+        'quit'   abbrechen
+    """
     raw = raw.strip().lower()
     if not raw:
         return ("skip", None)
@@ -271,6 +281,8 @@ def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None] | None:
         return ("quit", None)
     if raw == "s":
         return ("skip", None)
+    if raw == "n":
+        return ("n_all", None)
     parts = raw.split()
     verb = parts[0][0]
     arg_str = parts[1] if len(parts) > 1 else parts[0][1:]
@@ -308,7 +320,8 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
         # Pro Variante kann der User mehrere Aktionen ausfuehren, bis er
         # weiter geht (Enter/s/q).
         while True:
-            prompt = ("  u <n> URL | n <n> kein-Treffer | s skip | q quit > ")
+            prompt = ("  u <n> URL | n <n> kein-Treffer | n alle Luecken | "
+                      "s skip | q quit > ")
             raw = _safe_input(prompt)
             if raw is None:
                 return
@@ -322,6 +335,22 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
                 return
             if verb == "skip":
                 break
+            if verb == "n_all":
+                # Alle LUECKEN dieser Variante in einem Rutsch als no-match
+                # markieren. MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet,
+                # damit ein vorhandener Treffer nicht ueberschrieben wird.
+                marked = 0
+                for c in comps:
+                    lbl, _ = _status(listings, cands, vkey, c["competitor_id"])
+                    if lbl == "LUECKE":
+                        _mark_no_match(conn, v, c)
+                        marked += 1
+                if marked == 0:
+                    print("  -> Keine LUECKEN zu markieren "
+                          "(fuer einzelne Eintraege 'n <n>' nutzen).")
+                else:
+                    _reload_for(vkey)
+                continue
             comp = comps[arg - 1]
             if verb == "u":
                 ok = _link_manual(conn, v, comp)
