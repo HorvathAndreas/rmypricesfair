@@ -44,14 +44,24 @@ SECTION_LABELS = {
 # --- Datenbeschaffung ----------------------------------------------------------
 
 def _fetch_rows(conn) -> list[dict]:
-    """Liefert pro Variante my_chf + Liste aller comp-Eintraege (mit Preisen)."""
+    """Liefert pro Variante den Master-Preis (CH-Listenpreis) + Liste aller
+    comp-Eintraege. Pro Mitbewerber wird der eigene Preis aus
+    my_variant_price[competitor.country_iso] gezogen; fehlt der Eintrag,
+    faellt der Vergleich auf den Master-Preis (FX-umgerechnet) zurueck."""
     rows = conn.execute(
         """
         SELECT
             v.id_product, v.id_product_attribute, v.name, v.variant_label,
-            v.price AS my_price, v.currency AS my_currency,
-            ROUND(v.price * COALESCE(fxv.rate_to_chf, 1.0), 2) AS my_chf,
+            v.price AS my_master_price, v.currency AS my_master_currency,
+            ROUND(v.price * COALESCE(fxmaster.rate_to_chf, 1.0), 2) AS my_master_chf,
+            -- Land-spezifischer Eigenpreis (z.B. DE) mit Fallback aufs Master
+            COALESCE(mvp.price, v.price) AS my_price,
+            COALESCE(mvp.currency, v.currency) AS my_currency,
+            ROUND(COALESCE(mvp.price, v.price)
+                  * COALESCE(fxmy.rate_to_chf, 1.0), 2) AS my_chf,
+            mvp.country_iso AS my_country,
             c.name AS comp_name,
+            c.country_iso AS comp_country,
             l.last_price AS comp_price, l.last_currency AS comp_currency,
             ROUND(l.last_price * COALESCE(fxc.rate_to_chf, 1.0), 2) AS comp_chf,
             l.comp_url, l.in_stock
@@ -60,8 +70,13 @@ def _fetch_rows(conn) -> list[dict]:
             ON l.id_product = v.id_product
            AND l.id_product_attribute = v.id_product_attribute
         JOIN competitor c ON c.competitor_id = l.competitor_id
-        LEFT JOIN fx_rate fxv ON fxv.currency = v.currency
-        LEFT JOIN fx_rate fxc ON fxc.currency = l.last_currency
+        LEFT JOIN my_variant_price mvp
+            ON mvp.id_product = v.id_product
+           AND mvp.id_product_attribute = v.id_product_attribute
+           AND mvp.country_iso = c.country_iso
+        LEFT JOIN fx_rate fxmaster ON fxmaster.currency = v.currency
+        LEFT JOIN fx_rate fxmy     ON fxmy.currency = COALESCE(mvp.currency, v.currency)
+        LEFT JOIN fx_rate fxc      ON fxc.currency = l.last_currency
         WHERE v.active = 1 AND l.active = 1 AND l.confirmed = 1
           AND l.last_price IS NOT NULL AND v.price IS NOT NULL
           AND l.match_method != 'no-match'
@@ -80,31 +95,41 @@ def _fetch_rows(conn) -> list[dict]:
                 "id_product_attribute": r["id_product_attribute"],
                 "name": r["name"],
                 "variant_label": r["variant_label"],
-                "my_chf": r["my_chf"],
-                "my_currency": r["my_currency"],
-                "my_price": r["my_price"],
+                # Der angezeigte 'meiner'-Preis im Header ist der Master.
+                "my_chf": r["my_master_chf"],
+                "my_currency": r["my_master_currency"],
+                "my_price": r["my_master_price"],
                 "comps": [],
             }
             by_var[key] = slot
         slot["comps"].append({
             "name": r["comp_name"],
+            "country": r["comp_country"],
             "chf":  r["comp_chf"],
             "price": r["comp_price"],
             "currency": r["comp_currency"],
             "url": r["comp_url"],
+            # Pro Mitbewerber der eigene, ggf. land-spezifische Preis in CHF;
+            # die Diff fuer match/teurer/guenstiger laeuft gegen DIESEN Wert,
+            # nicht gegen den Header-Master-Preis.
+            "my_chf": r["my_chf"],
+            "my_country": r["my_country"],   # None, wenn nur Fallback genutzt
         })
     return list(by_var.values())
 
 
 # --- Kategorisierung -----------------------------------------------------------
 
-def _categorize(my_chf: float, comp_chfs: list[float], tol: float) -> str:
-    diffs = [c - my_chf for c in comp_chfs]
-    if all(abs(d) <= tol for d in diffs):
+def _categorize(comp_diffs: list[float], tol: float) -> str:
+    """Kategorisierung basiert auf pro-Mitbewerber-Diffs (comp_chf - my_chf),
+    wobei my_chf der land-spezifische Eigenpreis ist."""
+    if not comp_diffs:
         return "match"
-    if all(d < -tol for d in diffs):
+    if all(abs(d) <= tol for d in comp_diffs):
+        return "match"
+    if all(d < -tol for d in comp_diffs):
         return "teurer"        # alle Mitbewerber liegen unter mir
-    if all(d > tol for d in diffs):
+    if all(d > tol for d in comp_diffs):
         return "guenstiger"    # alle Mitbewerber liegen ueber mir
     return "mittelfeld"
 
@@ -120,13 +145,16 @@ def _row_label(v: dict, width: int) -> str:
     return s
 
 
-def _fmt_comp(c: dict, my_chf: float, tol: float) -> str:
-    diff = c["chf"] - my_chf
+def _fmt_comp(c: dict, tol: float) -> str:
+    """Format: 'name(LAND): comp_chf (diff)'. Diff = comp_chf - per-comp my_chf.
+    Das Laender-Tag macht sichtbar, gegen welchen Eigenpreis verglichen wird."""
+    diff = c["chf"] - c["my_chf"]
     if abs(diff) <= tol:
         marker = "="
     else:
         marker = f"{diff:+.2f}"
-    return f"{c['name']}: {c['chf']:.2f} ({marker})"
+    tag = f"({c['country']})" if c["country"] else ""
+    return f"{c['name']}{tag}: {c['chf']:.2f} ({marker})"
 
 
 def _print_section(key: str, items: list[dict], tol: float, name_w: int = 46) -> None:
@@ -140,7 +168,7 @@ def _print_section(key: str, items: list[dict], tol: float, name_w: int = 46) ->
     print(f"  {'Variante':<{name_w}}  {'meiner':>10}  Mitbewerber")
     print(f"  {'-' * name_w}  {'-' * 10}  {'-' * 50}")
     for v in items:
-        comps = ", ".join(_fmt_comp(c, v["my_chf"], tol) for c in v["comps"])
+        comps = ", ".join(_fmt_comp(c, tol) for c in v["comps"])
         print(f"  {_row_label(v, name_w):<{name_w}}  "
               f"{v['my_chf']:>7.2f} CHF  {comps}")
 
@@ -166,17 +194,20 @@ def main(argv: list[str]) -> int:
 
     sections: dict[str, list[dict]] = defaultdict(list)
     for v in items:
-        comp_chfs = [c["chf"] for c in v["comps"]]
-        cat = _categorize(v["my_chf"], comp_chfs, args.tol)
+        # Diffs sind comp_chf - per-comp-my_chf, damit DE-Comp gegen DE-Preis
+        # und CH-Comp gegen CH-Preis verglichen wird.
+        comp_diffs = [c["chf"] - c["my_chf"] for c in v["comps"]]
+        cat = _categorize(comp_diffs, args.tol)
         sections[cat].append(v)
 
     # Sortierung pro Sektion: dort wo Handlungsdruck ist, das Dringendste oben.
     sections["match"].sort(key=lambda v: v["name"])
     sections["teurer"].sort(
-        key=lambda v: -(v["my_chf"] - min(c["chf"] for c in v["comps"]))
+        # Groesster Abstand zu meinem (Land-)Eigenpreis nach oben.
+        key=lambda v: -max(c["my_chf"] - c["chf"] for c in v["comps"])
     )
     sections["guenstiger"].sort(
-        key=lambda v: -(min(c["chf"] for c in v["comps"]) - v["my_chf"])
+        key=lambda v: -max(c["chf"] - c["my_chf"] for c in v["comps"])
     )
     sections["mittelfeld"].sort(key=lambda v: v["name"])
 

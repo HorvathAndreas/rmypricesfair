@@ -43,7 +43,8 @@ from pathlib import Path
 import httpx
 import yaml
 
-from db import DEFAULT_DB, get_connection, init_db, upsert_variant
+from db import (DEFAULT_DB, clear_my_variant_prices, get_connection, init_db,
+                upsert_my_variant_price, upsert_variant)
 
 # Politeness: 1 Request/s, siehe CLAUDE.md.
 POLITENESS_SEC = 1.0
@@ -146,10 +147,16 @@ def _brutto(netto: float, rate_pct: float) -> float:
 # --- Sync ----------------------------------------------------------------------
 
 def _sync_master(client: httpx.Client, conn, base_url: str, currency: str,
+                 country_iso: str,
                  tax_lookup: dict[int, float],
-                 skip_patterns: list[str]) -> tuple[int, int, int, int, int]:
-    """Schreibt Varianten des Master-Shops nach my_variant.
-    Liefert (n_simple, n_collapsed, n_var, n_skipped_combos, n_deactivated)."""
+                 skip_patterns: list[str]) -> tuple[int, int, int, int, int,
+                                                     int, int, int]:
+    """Schreibt Varianten des Master-Shops nach my_variant UND parallel
+    den eigenen Brutto-Preis nach my_variant_price[country_iso].
+    Liefert (n_simple, n_collapsed, n_var, n_skipped, n_stale,
+             n_migrated, n_deduped, n_orphan)."""
+    # Stale Land-Preise des Masters loeschen - frisch befuellen.
+    clear_my_variant_prices(conn, country_iso)
     products = _fetch_active_products(client, base_url)
     combs = _fetch_all_combinations(client, base_url)
     option_values = _fetch_option_values(client, base_url)
@@ -181,13 +188,16 @@ def _sync_master(client: httpx.Client, conn, base_url: str, currency: str,
         prod_combs = combs_by_product.get(pid, [])
         if not prod_combs:
             # Echtes Single-Produkt
+            brutto = _brutto(base_netto, rate)
             upsert_variant(conn, {
                 "id_product": pid, "id_product_attribute": 0,
                 "reference": ref_p, "ean13": ean_p, "upc": upc_p,
                 "name": name, "variant_label": None,
-                "price": _brutto(base_netto, rate), "currency": currency,
+                "price": brutto, "currency": currency,
                 "active": 1,
             })
+            upsert_my_variant_price(conn, pid, 0, country_iso,
+                                    brutto, currency)
             touched.add((pid, 0))
             n_simple += 1
             continue
@@ -223,6 +233,8 @@ def _sync_master(client: httpx.Client, conn, base_url: str, currency: str,
                 "name": name, "variant_label": None,
                 "price": single_price, "currency": currency, "active": 1,
             })
+            upsert_my_variant_price(conn, pid, 0, country_iso,
+                                    single_price, currency)
             touched.add((pid, 0))
             n_collapsed += 1
         else:
@@ -237,6 +249,8 @@ def _sync_master(client: httpx.Client, conn, base_url: str, currency: str,
                     "name": name, "variant_label": label,
                     "price": price, "currency": currency, "active": 1,
                 })
+                upsert_my_variant_price(conn, pid, ipa, country_iso,
+                                        price, currency)
                 touched.add((pid, ipa))
                 n_var += 1
 
@@ -300,6 +314,89 @@ def _summary_only(client: httpx.Client, base_url: str) -> tuple[int, int, list[d
     return len(products), len(combs), products[:3]
 
 
+def _build_secondary_price_index(client: httpx.Client, base_url: str,
+                                 tax_lookup: dict[int, float],
+                                 skip_patterns: list[str]
+                                 ) -> tuple[dict[str, float], dict[str, float]]:
+    """Liest einen Nicht-Master-Shop und liefert zwei Lookups:
+    {reference -> brutto_preis} und {ean13 -> brutto_preis}, jeweils in der
+    Shop-Waehrung. Erstauftritt gewinnt - bei Mehrdeutigkeit wird der erste
+    behalten, das ist mit der Master-Logik konsistent."""
+    products = _fetch_active_products(client, base_url)
+    combs = _fetch_all_combinations(client, base_url)
+    option_values = _fetch_option_values(client, base_url)
+
+    skip_ids = {vid for vid, name in option_values.items()
+                if any(p.lower() in name.lower() for p in skip_patterns)}
+
+    combs_by_product: dict[int, list[dict]] = {}
+    for c in combs:
+        combs_by_product.setdefault(int(c["id_product"]), []).append(c)
+
+    by_ref: dict[str, float] = {}
+    by_ean: dict[str, float] = {}
+    for p in products:
+        pid = int(p["id"])
+        base_netto = float(p.get("price") or 0)
+        gid_raw = p.get("id_tax_rules_group")
+        gid = int(gid_raw) if gid_raw not in (None, "", "0", 0) else None
+        rate = tax_lookup.get(gid, 0.0) if gid else 0.0
+
+        ref_p = _clean(p.get("reference"))
+        ean_p = _clean(p.get("ean13"))
+
+        prod_combs = combs_by_product.get(pid, [])
+        if not prod_combs:
+            brutto = _brutto(base_netto, rate)
+            if ref_p: by_ref.setdefault(ref_p, brutto)
+            if ean_p: by_ean.setdefault(ean_p, brutto)
+            continue
+
+        for c in prod_combs:
+            if _combo_option_ids(c) & skip_ids:
+                continue
+            impact = float(c.get("price") or 0)
+            brutto = _brutto(base_netto + impact, rate)
+            ref_c = _clean(c.get("reference")) or ref_p
+            ean_c = _clean(c.get("ean13")) or ean_p
+            if ref_c: by_ref.setdefault(ref_c, brutto)
+            if ean_c: by_ean.setdefault(ean_c, brutto)
+    return by_ref, by_ean
+
+
+def _sync_secondary(client: httpx.Client, conn, base_url: str,
+                    country_iso: str, currency: str,
+                    tax_lookup: dict[int, float],
+                    skip_patterns: list[str]) -> tuple[int, int, int]:
+    """Synchronisiert einen Nicht-Master-Shop in my_variant_price[country_iso].
+    Zuordnung Master <-> Sekundaer ueber reference (priorisiert), sonst ean13.
+    Liefert (n_matched_ref, n_matched_ean, n_unmatched)."""
+    clear_my_variant_prices(conn, country_iso)
+    by_ref, by_ean = _build_secondary_price_index(
+        client, base_url, tax_lookup, skip_patterns)
+
+    n_ref = n_ean = n_unmatched = 0
+    for v in conn.execute(
+        "SELECT id_product, id_product_attribute, reference, ean13 "
+        "FROM my_variant WHERE active = 1").fetchall():
+        ref = (v["reference"] or "").strip()
+        ean = (v["ean13"] or "").strip()
+        price = None
+        if ref and ref in by_ref:
+            price = by_ref[ref]
+            n_ref += 1
+        elif ean and ean in by_ean:
+            price = by_ean[ean]
+            n_ean += 1
+        if price is None:
+            n_unmatched += 1
+            continue
+        upsert_my_variant_price(conn, v["id_product"], v["id_product_attribute"],
+                                country_iso, price, currency)
+    conn.commit()
+    return n_ref, n_ean, n_unmatched
+
+
 # --- CLI -----------------------------------------------------------------------
 
 def main(argv: list[str]) -> int:
@@ -340,22 +437,31 @@ def main(argv: list[str]) -> int:
                     skip_pats = s.get("skip_variant_attributes") or DEFAULT_SKIP_ATTRS
                     print(f"  Skip-Patterns: {skip_pats}")
                     ns, nc, nv, nsk, nd, nm, ndp, nor = _sync_master(
-                        client, conn, s["base_url"], s["currency"], tlk, skip_pats)
+                        client, conn, s["base_url"], s["currency"],
+                        s["country_iso"], tlk, skip_pats)
                     print(f"  geschrieben in my_variant: simple={ns}, collapsed={nc}, "
                           f"echte-varianten={nv}, gesamt={ns + nc + nv} "
                           f"({s['currency']} brutto)")
+                    print(f"  my_variant_price[{s['country_iso']}]: "
+                          f"{ns + nc + nv} Eintraege geschrieben")
                     print(f"  skip (Filter): {nsk} Combinations,  "
                           f"deaktiviert (stale): {nd}")
                     print(f"  listing-Migration: {nm} migriert auf ipa=0, "
                           f"{ndp} dedupliziert, {nor} verwaist (Produkt weg)")
                 else:
-                    np, nc, samples = _summary_only(client, s["base_url"])
-                    print(f"  Produkte={np}, Combinations={nc} "
-                          f"(nicht persistiert, kein Master)")
-                    for sp in samples:
-                        nm = _first_lang_value(sp.get("name")) or "?"
-                        print(f"    - id={sp['id']} ref={sp.get('reference') or '-'} "
-                              f"netto={sp.get('price')} {s['currency']}  {nm[:60]}")
+                    # Sekundaer-Shop: Preise in my_variant_price[country_iso]
+                    # schreiben, Zuordnung ueber reference/ean13.
+                    cid = _resolve_country_id(client, s["base_url"], s["country_iso"])
+                    tlk = _build_tax_lookup(client, s["base_url"], cid)
+                    print(f"  Land {s['country_iso']} id={cid}, "
+                          f"Steuergruppen geladen: {len(tlk)}")
+                    skip_pats = s.get("skip_variant_attributes") or DEFAULT_SKIP_ATTRS
+                    n_ref, n_ean, n_un = _sync_secondary(
+                        client, conn, s["base_url"], s["country_iso"],
+                        s["currency"], tlk, skip_pats)
+                    print(f"  my_variant_price[{s['country_iso']}]: "
+                          f"per reference={n_ref}, per ean13={n_ean}, "
+                          f"keine Zuordnung={n_un}")
             except httpx.HTTPError as e:
                 print(f"  HTTP-Fehler: {e}", file=sys.stderr)
                 return 1

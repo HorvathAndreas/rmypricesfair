@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -79,6 +80,23 @@ CREATE TABLE IF NOT EXISTS fx_rate (
     updated_at  TEXT
 );
 
+-- Pro-Land-Preis fuer die eigene Variante. Der Master-Shop fuellt den Eintrag
+-- fuer sein eigenes Land (z.B. CH). Weitere Shops (is_master=false in
+-- config.yaml) fuellen ihre Laender-Eintraege (z.B. DE). present_results.py
+-- waehlt pro Mitbewerber die Zeile mit passendem country_iso und faellt
+-- sonst auf my_variant.price + FX zurueck.
+CREATE TABLE IF NOT EXISTS my_variant_price (
+    id_product           INTEGER NOT NULL,
+    id_product_attribute INTEGER NOT NULL DEFAULT 0,
+    country_iso          TEXT NOT NULL,
+    price                REAL NOT NULL,
+    currency             TEXT NOT NULL,
+    PRIMARY KEY (id_product, id_product_attribute, country_iso),
+    FOREIGN KEY (id_product, id_product_attribute)
+        REFERENCES my_variant(id_product, id_product_attribute)
+);
+CREATE INDEX IF NOT EXISTS idx_mvp_country ON my_variant_price(country_iso);
+
 CREATE TABLE IF NOT EXISTS match_candidate (
     candidate_id         INTEGER PRIMARY KEY,
     id_product           INTEGER NOT NULL,
@@ -122,16 +140,48 @@ def get_connection(db_path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     """Legt Schema und Seed-Kurse an. Idempotent - mehrfach aufrufbar."""
     conn.executescript(SCHEMA)
-    # Migration: 'fetcher_config' wurde nach v1 ergaenzt. CREATE TABLE IF NOT
-    # EXISTS aktualisiert keine bestehende Tabelle, daher hier nachziehen.
+    # Migrations: CREATE TABLE IF NOT EXISTS aktualisiert keine bestehende
+    # Tabelle, daher fehlende Spalten manuell nachziehen.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(competitor)")}
     if "fetcher_config" not in cols:
         conn.execute("ALTER TABLE competitor ADD COLUMN fetcher_config TEXT")
+    if "country_iso" not in cols:
+        conn.execute("ALTER TABLE competitor ADD COLUMN country_iso TEXT")
+        # Best-effort Backfill ueber die TLD der base_url. Bei Unsicherheit
+        # bleibt NULL - present_results.py faellt dann auf den Master-Preis
+        # mit FX-Umrechnung zurueck (= bisheriges Verhalten).
+        for r in conn.execute(
+            "SELECT competitor_id, base_url FROM competitor "
+            "WHERE country_iso IS NULL").fetchall():
+            iso = _tld_country_iso(r[1])
+            if iso:
+                conn.execute(
+                    "UPDATE competitor SET country_iso=? WHERE competitor_id=?",
+                    (iso, r[0]))
     conn.executemany(
         "INSERT OR IGNORE INTO fx_rate (currency, rate_to_chf, updated_at) VALUES (?, ?, ?)",
         SEED_FX,
     )
     conn.commit()
+
+
+# --- Hilfsfunktionen ----------------------------------------------------------
+
+_ISO_TLDS = {"ch", "de", "at", "fr", "it", "li", "nl", "be", "lu",
+             "es", "pt", "se", "no", "dk", "fi", "pl", "cz"}
+
+
+def _tld_country_iso(base_url: str | None) -> str | None:
+    """Heuristisch das Land aus der Top-Level-Domain ableiten.
+    Liefert ISO-3166-1-alpha-2 oder None. Bsp.: '.ch' -> 'CH', '.de' -> 'DE'.
+    Nicht-Laender-TLDs (com/org/net etc.) -> None."""
+    if not base_url:
+        return None
+    m = re.search(r"\.([a-z]{2})(?::\d+)?(?:/|$)", base_url.lower())
+    if not m:
+        return None
+    tld = m.group(1)
+    return tld.upper() if tld in _ISO_TLDS else None
 
 
 # --- Eigener Katalog (my_variant) ---------------------------------------------
@@ -187,25 +237,59 @@ def get_active_competitors(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def upsert_competitor(conn: sqlite3.Connection, name: str, base_url: str,
                       platform: str = "shopify", currency: str = "EUR",
-                      fetcher_config: dict | None = None) -> int:
+                      fetcher_config: dict | None = None,
+                      country_iso: str | None = None) -> int:
     """Legt einen Mitbewerber an (oder aktualisiert per Name) und gibt die
     competitor_id zurueck. 'fetcher_config' wird als JSON gespeichert und
-    spaeter als kwargs an die Fetcher-Funktion durchgereicht."""
+    spaeter als kwargs an die Fetcher-Funktion durchgereicht. 'country_iso'
+    (z.B. 'CH', 'DE') steuert, welcher eigene Preis aus my_variant_price
+    fuer den Vergleich herangezogen wird."""
     cfg_json = json.dumps(fetcher_config) if fetcher_config is not None else None
+    iso = country_iso or _tld_country_iso(base_url)
     existing = conn.execute("SELECT competitor_id FROM competitor WHERE name = ?", (name,)).fetchone()
     if existing:
         conn.execute(
-            "UPDATE competitor SET base_url=?, platform=?, currency=?, fetcher_config=? "
+            "UPDATE competitor SET base_url=?, platform=?, currency=?, "
+            "fetcher_config=?, country_iso=COALESCE(?, country_iso) "
             "WHERE competitor_id=?",
-            (base_url, platform, currency, cfg_json, existing["competitor_id"]),
+            (base_url, platform, currency, cfg_json, iso,
+             existing["competitor_id"]),
         )
         return existing["competitor_id"]
     cur = conn.execute(
-        "INSERT INTO competitor (name, base_url, platform, currency, fetcher_config) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (name, base_url, platform, currency, cfg_json),
+        "INSERT INTO competitor (name, base_url, platform, currency, "
+        "fetcher_config, country_iso) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, base_url, platform, currency, cfg_json, iso),
     )
     return cur.lastrowid
+
+
+# --- Eigene Preise pro Land ---------------------------------------------------
+
+def upsert_my_variant_price(conn: sqlite3.Connection, id_product: int,
+                            id_product_attribute: int, country_iso: str,
+                            price: float, currency: str) -> None:
+    """Schreibt/aktualisiert den eigenen Preis fuer eine Variante in einem
+    bestimmten Land."""
+    conn.execute(
+        """
+        INSERT INTO my_variant_price
+            (id_product, id_product_attribute, country_iso, price, currency)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id_product, id_product_attribute, country_iso) DO UPDATE SET
+            price = excluded.price,
+            currency = excluded.currency
+        """,
+        (id_product, id_product_attribute, country_iso, price, currency),
+    )
+
+
+def clear_my_variant_prices(conn: sqlite3.Connection, country_iso: str) -> int:
+    """Leert alle Eintraege fuer ein Land - vor jedem Shop-Sync aufrufen,
+    damit Stale-Eintraege verschwinden."""
+    cur = conn.execute(
+        "DELETE FROM my_variant_price WHERE country_iso = ?", (country_iso,))
+    return cur.rowcount
 
 
 # --- Listings (Zuordnung + aktueller Preis) -----------------------------------
