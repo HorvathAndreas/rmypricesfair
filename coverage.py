@@ -16,10 +16,11 @@ Aktionen pro Variante:
   u <n> <URL>    URL direkt mitgeben (Kurzform, kein zweiter Prompt)
   n <n>          Mitbewerber Nr. n als 'kein Treffer' markieren
   n              alle LUECKEN der Variante als 'kein Treffer' markieren
-                 (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet)
+                 (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet,
+                 danach automatisch naechste Variante)
   nv <n>         alle LUECKEN aller Varianten desselben Vendors (= erstes
                  Wort im Produktnamen) bei Mitbewerber Nr. n als no-match
-                 markieren. Mit Sicherheitsabfrage.
+                 markieren. Sicherheitsabfrage; nach Erfolg auto-Advance.
   nv             Kurzform fuer 'nv <n>', wenn nur ein Mitbewerber sichtbar
                  ist (--competitor X).
   s              Skip - naechste Variante
@@ -482,6 +483,7 @@ def _run_dialog(conn, variants, all_variants, comps, listings, cands,
                 # Alle LUECKEN dieser Variante in einem Rutsch als no-match
                 # markieren. MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet,
                 # damit ein vorhandener Treffer nicht ueberschrieben wird.
+                # Nach Erfolg geht's automatisch zur naechsten Variante.
                 marked = 0
                 for c in comps:
                     lbl, _ = _status(listings, cands, vkey, c["competitor_id"])
@@ -491,21 +493,26 @@ def _run_dialog(conn, variants, all_variants, comps, listings, cands,
                 if marked == 0:
                     print("  -> Keine LUECKEN zu markieren "
                           "(fuer einzelne Eintraege 'n <n>' nutzen).")
-                else:
-                    _reload_for(vkey)
-                continue
+                    continue
+                _reload_for(vkey)
+                break
             if verb == "nv_default":
                 # nv ohne idx: nur sinnvoll im --competitor-Modus.
                 if not only_competitor:
                     print("  -> 'nv' ohne Mitbewerber-Index nur im "
                           "--competitor-Modus. Sonst 'nv <n>' angeben.")
                     continue
-                _bulk_vendor_no_match(conn, v, all_variants, comps[0],
-                                      listings, cands)
+                marked = _bulk_vendor_no_match(conn, v, all_variants, comps[0],
+                                               listings, cands)
+                if marked > 0:
+                    break  # auto-advance nach Vendor-Bulk
                 continue
             if verb == "nv":
-                _bulk_vendor_no_match(conn, v, all_variants, comps[arg - 1],
-                                      listings, cands)
+                marked = _bulk_vendor_no_match(conn, v, all_variants,
+                                               comps[arg - 1],
+                                               listings, cands)
+                if marked > 0:
+                    break  # auto-advance nach Vendor-Bulk
                 continue
             comp = comps[arg - 1]
             if verb == "u":
