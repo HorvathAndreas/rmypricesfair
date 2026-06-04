@@ -314,14 +314,30 @@ def _summary_only(client: httpx.Client, base_url: str) -> tuple[int, int, list[d
     return len(products), len(combs), products[:3]
 
 
+def _norm_name(s: str | None) -> str | None:
+    """Normalisierter Produkt-Name fuer exakten Vergleich: lowercase,
+    Whitespace zusammengezogen. Leere Strings -> None."""
+    if not s:
+        return None
+    out = " ".join(s.lower().split())
+    return out or None
+
+
 def _build_secondary_price_index(client: httpx.Client, base_url: str,
                                  tax_lookup: dict[int, float],
                                  skip_patterns: list[str]
-                                 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Liest einen Nicht-Master-Shop und liefert zwei Lookups:
-    {reference -> brutto_preis} und {ean13 -> brutto_preis}, jeweils in der
-    Shop-Waehrung. Erstauftritt gewinnt - bei Mehrdeutigkeit wird der erste
-    behalten, das ist mit der Master-Logik konsistent."""
+                                 ) -> tuple[dict[str, float],
+                                            dict[str, float],
+                                            dict[str, float]]:
+    """Liest einen Nicht-Master-Shop und liefert drei Lookups:
+    {reference -> brutto}, {ean13 -> brutto}, {normalized_name -> brutto},
+    jeweils in der Shop-Waehrung. Erstauftritt gewinnt.
+
+    Wichtig: pro Combination wird sowohl die Combination-eigene reference/ean
+    ALS AUCH die Product-Level-reference/ean indiziert. So funktioniert der
+    Lookup auch, wenn der Master collapsed gespeichert hat (eine Zeile pro
+    Produkt) und der Sekundaer-Shop pro Combination eigene SKUs fuehrt -
+    oder umgekehrt."""
     products = _fetch_active_products(client, base_url)
     combs = _fetch_all_combinations(client, base_url)
     option_values = _fetch_option_values(client, base_url)
@@ -335,6 +351,7 @@ def _build_secondary_price_index(client: httpx.Client, base_url: str,
 
     by_ref: dict[str, float] = {}
     by_ean: dict[str, float] = {}
+    by_name: dict[str, float] = {}
     for p in products:
         pid = int(p["id"])
         base_netto = float(p.get("price") or 0)
@@ -344,12 +361,14 @@ def _build_secondary_price_index(client: httpx.Client, base_url: str,
 
         ref_p = _clean(p.get("reference"))
         ean_p = _clean(p.get("ean13"))
+        name_p = _norm_name(_first_lang_value(p.get("name")))
 
         prod_combs = combs_by_product.get(pid, [])
         if not prod_combs:
             brutto = _brutto(base_netto, rate)
             if ref_p: by_ref.setdefault(ref_p, brutto)
             if ean_p: by_ean.setdefault(ean_p, brutto)
+            if name_p: by_name.setdefault(name_p, brutto)
             continue
 
         for c in prod_combs:
@@ -357,30 +376,36 @@ def _build_secondary_price_index(client: httpx.Client, base_url: str,
                 continue
             impact = float(c.get("price") or 0)
             brutto = _brutto(base_netto + impact, rate)
-            ref_c = _clean(c.get("reference")) or ref_p
-            ean_c = _clean(c.get("ean13")) or ean_p
-            if ref_c: by_ref.setdefault(ref_c, brutto)
-            if ean_c: by_ean.setdefault(ean_c, brutto)
-    return by_ref, by_ean
+            # Beide Ebenen erfassen (combination + product), damit ein
+            # collapsed Master ueber ref_p findet und ein expanded Master
+            # ueber die combination-eigene ref.
+            for r in (_clean(c.get("reference")), ref_p):
+                if r: by_ref.setdefault(r, brutto)
+            for e in (_clean(c.get("ean13")), ean_p):
+                if e: by_ean.setdefault(e, brutto)
+            if name_p: by_name.setdefault(name_p, brutto)
+    return by_ref, by_ean, by_name
 
 
 def _sync_secondary(client: httpx.Client, conn, base_url: str,
                     country_iso: str, currency: str,
                     tax_lookup: dict[int, float],
-                    skip_patterns: list[str]) -> tuple[int, int, int]:
+                    skip_patterns: list[str]) -> tuple[int, int, int, int]:
     """Synchronisiert einen Nicht-Master-Shop in my_variant_price[country_iso].
-    Zuordnung Master <-> Sekundaer ueber reference (priorisiert), sonst ean13.
-    Liefert (n_matched_ref, n_matched_ean, n_unmatched)."""
+    Zuordnung Master <-> Sekundaer in dieser Reihenfolge: reference, ean13,
+    normalisierter Name (lowercase + Whitespace zusammengezogen).
+    Liefert (n_ref, n_ean, n_name, n_unmatched)."""
     clear_my_variant_prices(conn, country_iso)
-    by_ref, by_ean = _build_secondary_price_index(
+    by_ref, by_ean, by_name = _build_secondary_price_index(
         client, base_url, tax_lookup, skip_patterns)
 
-    n_ref = n_ean = n_unmatched = 0
+    n_ref = n_ean = n_name = n_unmatched = 0
     for v in conn.execute(
-        "SELECT id_product, id_product_attribute, reference, ean13 "
+        "SELECT id_product, id_product_attribute, reference, ean13, name "
         "FROM my_variant WHERE active = 1").fetchall():
         ref = (v["reference"] or "").strip()
         ean = (v["ean13"] or "").strip()
+        name = _norm_name(v["name"])
         price = None
         if ref and ref in by_ref:
             price = by_ref[ref]
@@ -388,13 +413,16 @@ def _sync_secondary(client: httpx.Client, conn, base_url: str,
         elif ean and ean in by_ean:
             price = by_ean[ean]
             n_ean += 1
+        elif name and name in by_name:
+            price = by_name[name]
+            n_name += 1
         if price is None:
             n_unmatched += 1
             continue
         upsert_my_variant_price(conn, v["id_product"], v["id_product_attribute"],
                                 country_iso, price, currency)
     conn.commit()
-    return n_ref, n_ean, n_unmatched
+    return n_ref, n_ean, n_name, n_unmatched
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -456,12 +484,12 @@ def main(argv: list[str]) -> int:
                     print(f"  Land {s['country_iso']} id={cid}, "
                           f"Steuergruppen geladen: {len(tlk)}")
                     skip_pats = s.get("skip_variant_attributes") or DEFAULT_SKIP_ATTRS
-                    n_ref, n_ean, n_un = _sync_secondary(
+                    n_ref, n_ean, n_name, n_un = _sync_secondary(
                         client, conn, s["base_url"], s["country_iso"],
                         s["currency"], tlk, skip_pats)
                     print(f"  my_variant_price[{s['country_iso']}]: "
                           f"per reference={n_ref}, per ean13={n_ean}, "
-                          f"keine Zuordnung={n_un}")
+                          f"per name={n_name}, keine Zuordnung={n_un}")
             except httpx.HTTPError as e:
                 print(f"  HTTP-Fehler: {e}", file=sys.stderr)
                 return 1
