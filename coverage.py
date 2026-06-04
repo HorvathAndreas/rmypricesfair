@@ -17,9 +17,17 @@ Aktionen pro Variante:
   n <n>          Mitbewerber Nr. n als 'kein Treffer' markieren
   n              alle LUECKEN der Variante als 'kein Treffer' markieren
                  (MATCH/NO-MATCH/AUTO/REVIEW bleiben unangetastet)
+  nv <n>         alle LUECKEN aller Varianten desselben Vendors (= erstes
+                 Wort im Produktnamen) bei Mitbewerber Nr. n als no-match
+                 markieren. Mit Sicherheitsabfrage.
+  nv             Kurzform fuer 'nv <n>', wenn nur ein Mitbewerber sichtbar
+                 ist (--competitor X).
   s              Skip - naechste Variante
   q              Quit
   Enter          naechste Variante
+
+Im --competitor-Modus springt der Dialog nach Bulk-Aktionen automatisch
+ueber bereits abgehandelte Varianten zur naechsten offenen.
 
 Manuelles Hinterlegen einer URL ruft den plattform-spezifischen
 'fetch_one'-Helfer auf, parst die Seite, zeigt eine Vorschau und schreibt
@@ -249,18 +257,86 @@ def _link_manual(conn, v, comp, url: str | None = None) -> bool:
     return True
 
 
-def _mark_no_match(conn, v, comp) -> None:
-    upsert_listing(conn, {
+def _no_match_row(v, cid: int) -> dict:
+    """Erzeugt die upsert-Payload fuer ein no-match Listing."""
+    return {
         "id_product": v["id_product"],
         "id_product_attribute": v["id_product_attribute"],
-        "competitor_id": comp["competitor_id"],
+        "competitor_id": cid,
         "comp_name": None, "comp_reference": None, "comp_ean13": None,
         "comp_upc": None, "comp_url": None, "comp_variant_ref": None,
         "match_method": "no-match",
         "confirmed": 1,
-    })
+    }
+
+
+def _mark_no_match(conn, v, comp) -> None:
+    upsert_listing(conn, _no_match_row(v, comp["competitor_id"]))
     conn.commit()
     print(f"  -> {comp['name']}: als 'no-match' gespeichert.")
+
+
+def _vendor_token(name: str | None) -> str | None:
+    """Erstes Wort des Produktnamens. In diesem Shop konventionell der
+    Vendor/Marke ('2bfree Superstatic ...' -> '2bfree')."""
+    if not name:
+        return None
+    parts = name.strip().split()
+    return parts[0] if parts else None
+
+
+def _bulk_vendor_no_match(conn, current_v, all_variants, comp,
+                          listings, cands) -> int:
+    """Markiert alle aktiven Varianten desselben Vendors bei diesem
+    Mitbewerber als no-match - aber nur die, die aktuell LUECKE sind.
+    Liefert die Anzahl tatsaechlich geschriebener Eintraege."""
+    vendor = _vendor_token(current_v["name"])
+    if not vendor:
+        print("  -> Kein Vendor-Token aus dem Produktnamen ableitbar.")
+        return 0
+    vendor_low = vendor.lower()
+    cid = comp["competitor_id"]
+
+    # Alle aktiven Varianten desselben Vendors, die bei diesem Mitbewerber
+    # noch LUECKE sind.
+    gaps_v = []
+    for v in all_variants:
+        if (_vendor_token(v["name"]) or "").lower() != vendor_low:
+            continue
+        vkey = (v["id_product"], v["id_product_attribute"])
+        if _status(listings, cands, vkey, cid)[0] == "LUECKE":
+            gaps_v.append(v)
+
+    if not gaps_v:
+        print(f"  -> Vendor '{vendor}': keine LUECKEN bei {comp['name']}.")
+        return 0
+
+    confirm = _safe_input(
+        f"  Vendor '{vendor}': {len(gaps_v)} Variante(n) bei {comp['name']} "
+        f"als no-match markieren? [j/N] > "
+    )
+    if confirm is None or confirm.strip().lower() not in ("j", "y", "ja", "yes"):
+        print("  -> Abgebrochen.")
+        return 0
+
+    for v in gaps_v:
+        upsert_listing(conn, _no_match_row(v, cid))
+    conn.commit()
+
+    # In-Memory-listings nachziehen, damit die naechste Anzeige stimmt
+    # und die keep-Predikate die jetzt erledigten Varianten ueberspringen.
+    for v in gaps_v:
+        r = conn.execute(
+            "SELECT * FROM listing WHERE id_product=? "
+            "AND id_product_attribute=? AND competitor_id=? AND active=1",
+            (v["id_product"], v["id_product_attribute"], cid),
+        ).fetchone()
+        if r is not None:
+            listings[(v["id_product"], v["id_product_attribute"], cid)] = r
+
+    print(f"  -> {len(gaps_v)} Variante(n) von Vendor '{vendor}' "
+          f"bei {comp['name']} als no-match gespeichert.")
+    return len(gaps_v)
 
 
 # --- Hauptschleife ------------------------------------------------------------
@@ -274,6 +350,10 @@ def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None, str | None] 
         u <n> <URL>      URL direkt mitgeben (Kurzform)
         n <n>            no-match fuer Mitbewerber idx
         n                no-match fuer alle LUECKEN dieser Variante
+        nv <n>           alle Varianten des gleichen Vendors als no-match
+                         bei Mitbewerber idx markieren (nur LUECKEN)
+        nv               nv-Bulk, defaultet auf den einzigen sichtbaren
+                         Mitbewerber im --competitor-Modus
         s | <Enter>      weiter zur naechsten Variante
         q                abbrechen
 
@@ -290,16 +370,25 @@ def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None, str | None] 
         return ("skip", None, None)
     if low == "n":
         return ("n_all", None, None)
+    if low == "nv":
+        return ("nv_default", None, None)
 
     parts = raw.split()
     first_low = parts[0].lower()
-    if not first_low or first_low[0] not in ("u", "n"):
-        return None
-    verb = first_low[0]
 
-    # idx steht entweder direkt am Verb ('u3') oder als naechstes Token ('u 3')
-    if len(first_low) > 1:
-        idx_str = first_low[1:]
+    # Verb erkennen: 'nv' zuerst pruefen (2 Zeichen), dann 'u'/'n' (1 Zeichen).
+    if first_low.startswith("nv"):
+        verb = "nv"
+        idx_in_verb = first_low[2:]
+    elif first_low and first_low[0] in ("u", "n"):
+        verb = first_low[0]
+        idx_in_verb = first_low[1:]
+    else:
+        return None
+
+    # idx steht entweder direkt am Verb ('u3', 'nv1') oder als naechstes Token
+    if idx_in_verb:
+        idx_str = idx_in_verb
         extras = parts[1:]
     else:
         if len(parts) < 2:
@@ -317,6 +406,11 @@ def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None, str | None] 
             return None
         return ("n", idx, None)
 
+    if verb == "nv":
+        if extras:
+            return None
+        return ("nv", idx, None)
+
     # verb == 'u': optional URL als zweites Argument
     if extras:
         if len(extras) > 1:
@@ -328,11 +422,15 @@ def _parse_action(raw: str, n_comps: int) -> tuple[str, int | None, str | None] 
     return ("u", idx, None)
 
 
-def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | None) -> None:
-    # Listings/Kandidaten cachen wir lokal; nach jeder Aktion targetiert
-    # nachladen, damit der naechste Variant-Print frisch ist.
+def _run_dialog(conn, variants, all_variants, comps, listings, cands,
+                only_competitor: str | None, keep) -> None:
+    """variants     - bereits gefilterte Liste (Iteration)
+    all_variants - alle aktiven Varianten (fuer Vendor-Bulk)
+    keep(v)      - Predikat, ob die Variante (nach Bulk-Aktionen evtl.
+                   nicht mehr passend) noch im Workflow ist.
+    """
+    # Listings cachen wir lokal; nach jeder Aktion targetiert nachladen.
     def _reload_for(vkey):
-        # Listings dieser Variante neu einlesen.
         for cid in (c["competitor_id"] for c in comps):
             r = conn.execute(
                 "SELECT * FROM listing WHERE id_product=? "
@@ -346,13 +444,24 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
                 listings[key] = r
 
     total = len(variants)
+    skipped_silently = 0
     for idx, v in enumerate(variants, 1):
+        # Bulk-Aktionen koennen Varianten weiter unten in der Liste vorab
+        # abhandeln. Solche stillschweigend ueberspringen, damit der User
+        # nicht durch lauter NO-MATCH-Bildschirme klickt.
+        if not keep(v):
+            skipped_silently += 1
+            continue
         vkey = (v["id_product"], v["id_product_attribute"])
+        if skipped_silently:
+            print(f"  ({skipped_silently} bereits abgehandelte Variante(n) "
+                  f"uebersprungen.)")
+            skipped_silently = 0
         _print_variant(v, comps, listings, cands, idx, total)
         # Pro Variante kann der User mehrere Aktionen ausfuehren, bis er
         # weiter geht (Enter/s/q).
         while True:
-            prompt = ("  u <n> [URL] | n <n> kein-Treffer | n alle Luecken | "
+            prompt = ("  u <n> [URL] | n <n> | n alle | nv <n> Vendor-Bulk | "
                       "s skip | q quit > ")
             raw = _safe_input(prompt)
             if raw is None:
@@ -361,7 +470,7 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
             if parsed is None:
                 print("  -> Eingabe nicht erkannt. Beispiele: "
                       "'u 1 https://...', 'u 1' (URL spaeter), 'n 2', "
-                      "'n' (alle Luecken), 's', 'q'.")
+                      "'n' (alle Luecken), 'nv 1' (Vendor-Bulk), 's', 'q'.")
                 continue
             verb, arg, url = parsed
             if verb == "quit":
@@ -384,6 +493,19 @@ def _run_dialog(conn, variants, comps, listings, cands, only_competitor: str | N
                           "(fuer einzelne Eintraege 'n <n>' nutzen).")
                 else:
                     _reload_for(vkey)
+                continue
+            if verb == "nv_default":
+                # nv ohne idx: nur sinnvoll im --competitor-Modus.
+                if not only_competitor:
+                    print("  -> 'nv' ohne Mitbewerber-Index nur im "
+                          "--competitor-Modus. Sonst 'nv <n>' angeben.")
+                    continue
+                _bulk_vendor_no_match(conn, v, all_variants, comps[0],
+                                      listings, cands)
+                continue
+            if verb == "nv":
+                _bulk_vendor_no_match(conn, v, all_variants, comps[arg - 1],
+                                      listings, cands)
                 continue
             comp = comps[arg - 1]
             if verb == "u":
@@ -424,35 +546,45 @@ def main(argv: list[str]) -> int:
     conn = get_connection(args.db)
     init_db(conn)
 
-    variants, comps, listings, cands = _load_state(conn, args.competitor)
-    if variants is None:
+    all_variants, comps, listings, cands = _load_state(conn, args.competitor)
+    if all_variants is None:
         return 2
     if not comps:
         print("Keine aktiven Mitbewerber.", file=sys.stderr)
         return 1
-    if not variants:
+    if not all_variants:
         print("Keine aktiven Varianten in my_variant.", file=sys.stderr)
         return 1
 
     comp_ids = [c["competitor_id"] for c in comps]
+    # 'keep' wird beim initialen Filtern UND bei jedem Loop-Schritt verwendet,
+    # damit Bulk-Aktionen (z.B. 'nv 1') hinten in der Liste liegende
+    # Varianten still ueberspringen koennen.
     if args.competitor:
-        cid = comps[0]["competitor_id"]
-        variants = [v for v in variants
-                    if _has_unresolved_for(listings, cands,
-                                           (v["id_product"], v["id_product_attribute"]),
-                                           cid)]
+        target_cid = comps[0]["competitor_id"]
+        def keep(v):
+            return _has_unresolved_for(
+                listings, cands,
+                (v["id_product"], v["id_product_attribute"]),
+                target_cid)
     elif args.only_gaps:
-        variants = [v for v in variants
-                    if _has_gap(listings, cands,
-                                (v["id_product"], v["id_product_attribute"]),
-                                comp_ids)]
+        def keep(v):
+            return _has_gap(
+                listings, cands,
+                (v["id_product"], v["id_product_attribute"]),
+                comp_ids)
+    else:
+        def keep(_v):
+            return True
 
+    variants = [v for v in all_variants if keep(v)]
     if not variants:
         print("Nichts zu tun - keine Variante erfuellt den Filter.")
         return 0
 
     print(f"\n{len(variants)} Variante(n), {len(comps)} Mitbewerber.")
-    _run_dialog(conn, variants, comps, listings, cands, args.competitor)
+    _run_dialog(conn, variants, all_variants, comps, listings, cands,
+                args.competitor, keep)
     conn.close()
     return 0
 
