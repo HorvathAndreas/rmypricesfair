@@ -31,6 +31,9 @@ from collections import defaultdict
 from db import DEFAULT_DB, get_connection, init_db
 
 DEFAULT_TOL_CHF = 0.01  # Toleranz fuer Preisgleichheit
+DEFAULT_MIN_COMP_CHF = 1.0  # Mitbewerber-Preise darunter gelten als Platzhalter
+                            # (z.B. 0.01 CHF fuer "Preis auf Anfrage") und werden
+                            # nicht in den Vergleich gezogen.
 
 SECTION_KEYS = ["match", "teurer", "guenstiger", "mittelfeld"]
 SECTION_LABELS = {
@@ -43,11 +46,14 @@ SECTION_LABELS = {
 
 # --- Datenbeschaffung ----------------------------------------------------------
 
-def _fetch_rows(conn) -> list[dict]:
+def _fetch_rows(conn, min_comp_chf: float) -> tuple[list[dict], int]:
     """Liefert pro Variante den Master-Preis (CH-Listenpreis) + Liste aller
     comp-Eintraege. Pro Mitbewerber wird der eigene Preis aus
     my_variant_price[competitor.country_iso] gezogen; fehlt der Eintrag,
-    faellt der Vergleich auf den Master-Preis (FX-umgerechnet) zurueck."""
+    faellt der Vergleich auf den Master-Preis (FX-umgerechnet) zurueck.
+
+    Liefert zusaetzlich die Anzahl Mitbewerber-Listings, die wegen
+    Platzhalter-Preis (comp_chf < min_comp_chf) ausgefiltert wurden."""
     rows = conn.execute(
         """
         SELECT
@@ -84,6 +90,10 @@ def _fetch_rows(conn) -> list[dict]:
         ORDER BY v.id_product, v.id_product_attribute, c.name
         """
     ).fetchall()
+    n_dropped = sum(1 for r in rows if r["comp_chf"] is not None
+                                       and r["comp_chf"] < min_comp_chf)
+    rows = [r for r in rows if r["comp_chf"] is None
+                               or r["comp_chf"] >= min_comp_chf]
 
     by_var: dict[tuple[int, int], dict] = {}
     for r in rows:
@@ -115,7 +125,7 @@ def _fetch_rows(conn) -> list[dict]:
             "my_chf": r["my_chf"],
             "my_country": r["my_country"],   # None, wenn nur Fallback genutzt
         })
-    return list(by_var.values())
+    return list(by_var.values()), n_dropped
 
 
 # --- Kategorisierung -----------------------------------------------------------
@@ -182,12 +192,16 @@ def main(argv: list[str]) -> int:
                     help="nur diese Sektion ausgeben")
     ap.add_argument("--tol", type=float, default=DEFAULT_TOL_CHF,
                     help=f"Toleranz CHF fuer Preis-Match (Default {DEFAULT_TOL_CHF})")
+    ap.add_argument("--min-comp-price", type=float, default=DEFAULT_MIN_COMP_CHF,
+                    help=f"Mitbewerber-Preise unter diesem CHF-Wert als "
+                         f"Platzhalter werten und ignorieren "
+                         f"(Default {DEFAULT_MIN_COMP_CHF})")
     args = ap.parse_args(argv[1:])
 
     conn = get_connection(args.db)
     init_db(conn)
 
-    items = _fetch_rows(conn)
+    items, n_dropped = _fetch_rows(conn, args.min_comp_price)
     if not items:
         print("Keine bestaetigten Listings mit aktuellem Preis vorhanden.")
         return 0
@@ -214,6 +228,9 @@ def main(argv: list[str]) -> int:
     total_comps = sum(len(v["comps"]) for v in items)
     print(f"\n{len(items)} Varianten verglichen ueber {total_comps} Mitbewerber-Listings "
           f"(Toleranz {args.tol:.2f} CHF).")
+    if n_dropped:
+        print(f"  ({n_dropped} Mitbewerber-Listings unter {args.min_comp_price:.2f} CHF "
+              f"als Platzhalter ignoriert.)")
 
     order = [args.section] if args.section else SECTION_KEYS
     for key in order:

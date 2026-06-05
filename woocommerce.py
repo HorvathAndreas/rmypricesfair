@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import time
+from urllib.parse import urlparse
 
 import httpx
 
@@ -111,6 +112,41 @@ def fetch(base_url: str) -> list[dict]:
                 records.append(rec)
 
     return records
+
+
+def fetch_one(url: str, **_unused) -> dict | None:
+    """Holt eine einzelne WooCommerce-Produktseite ueber die Store API.
+    Der Slug wird aus dem letzten Pfad-Segment der URL abgeleitet, dann
+    /wp-json/wc/store/v1/products?slug=<slug> abgefragt.
+
+    Variable Produkte: liefern den Eltern-Datensatz; 'price' aus prices.price
+    ist dann der niedrigste sichtbare Preis und 'variant_ref' die parent-id.
+    Fuer einen exakten Varianten-Treffer muesste die variation_id bekannt sein,
+    die steht nicht im Permalink.
+
+    Zusaetzliche kwargs werden ignoriert (Symmetrie zum schema_org.fetch_one).
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        print(f"  ! Ungueltige URL: {url}", file=sys.stderr)
+        return None
+    segments = [s for s in parsed.path.split("/") if s]
+    if not segments:
+        print(f"  ! Konnte keinen Slug aus URL ableiten: {url}", file=sys.stderr)
+        return None
+    slug = segments[-1]
+    api = f"{parsed.scheme}://{parsed.netloc}{STORE_API}"
+    with httpx.Client(headers={"User-Agent": USER_AGENT},
+                      timeout=TIMEOUT, follow_redirects=True) as client:
+        r = client.get(api, params={"slug": slug})
+        if r.status_code != 200:
+            print(f"  ! {r.url} -> HTTP {r.status_code}", file=sys.stderr)
+            return None
+        items = r.json() or []
+        if not items:
+            return None
+        p = items[0]
+        return _record(p, p.get("name", ""), None)
 
 
 if __name__ == "__main__":

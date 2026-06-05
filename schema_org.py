@@ -67,7 +67,8 @@ _AVAIL_OUT = {
 
 # --- Sitemap-Discovery --------------------------------------------------------
 
-_LOC_RE = re.compile(r"<loc>([^<]+)</loc>", re.I)
+# <loc> kann den Wert direkt enthalten oder per CDATA wrappen (PrestaShop).
+_LOC_RE = re.compile(r"<loc>\s*(?:<!\[CDATA\[)?(.+?)(?:\]\]>)?\s*</loc>", re.I | re.S)
 
 
 def _get(client: httpx.Client, url: str) -> str | None:
@@ -86,11 +87,15 @@ def _get(client: httpx.Client, url: str) -> str | None:
 
 def _collect_product_urls(client: httpx.Client, base_url: str,
                           sitemap_filter: str,
-                          product_url_re: re.Pattern) -> list[str]:
+                          product_url_re: re.Pattern,
+                          sitemap_index_path: str = SITEMAP_INDEX_PATH
+                          ) -> list[str]:
     """Holt den Sitemap-Index, folgt allen Sub-Sitemaps, deren URL
     'sitemap_filter' als Substring enthaelt, und liefert die deduplizierten
-    Produkt-URLs (alle <loc>-Eintraege, die 'product_url_re' matchen)."""
-    index_url = urljoin(base_url, SITEMAP_INDEX_PATH)
+    Produkt-URLs (alle <loc>-Eintraege, die 'product_url_re' matchen).
+    'sitemap_index_path' ist relativ zu 'base_url'; nicht jeder Shop nutzt
+    den Default '/sitemap.xml' (PrestaShop z.B. '/1_index_sitemap.xml')."""
+    index_url = urljoin(base_url, sitemap_index_path)
     body = _get(client, index_url)
     if not body:
         return []
@@ -157,8 +162,12 @@ def _parse_product_page(url: str, body: str,
     raw_price = props.get("price")
     if not raw_price:
         return None
+    # itemprop="price" kann ein reiner content="39.00" Wert sein oder ein
+    # Text mit Waehrungs-Suffix ("39.00 CHF") bzw. Tausender-Apostroph
+    # ("1'234.50"). Alles Nicht-Numerische rauswerfen, dann , -> .
+    num = re.sub(r"[^\d.,-]+", "", raw_price).replace("'", "")
     try:
-        price = float(raw_price.replace(",", "."))
+        price = float(num.replace(",", "."))
     except ValueError:
         return None
 
@@ -205,13 +214,17 @@ def _parse_product_page(url: str, body: str,
 # --- Public API ---------------------------------------------------------------
 
 def fetch(base_url: str, *, sitemap_filter: str, product_url_regex: str,
-          limit: int | None = None) -> list[dict]:
+          limit: int | None = None,
+          sitemap_index_path: str = SITEMAP_INDEX_PATH) -> list[dict]:
     """Crawlt den Shop unter 'base_url' und liefert normalisierte Records.
 
     sitemap_filter      Substring fuer die Auswahl der Shop-Sub-Sitemaps.
     product_url_regex   Regex mit einer Capture-Gruppe fuer die variant_ref;
                         nur passende <loc>-Eintraege werden als Produkte
                         gezaehlt.
+    sitemap_index_path  Pfad zur Sitemap-Index-Datei (relativ zu base_url).
+                        Default '/sitemap.xml'; PrestaShop nutzt z.B.
+                        '/1_index_sitemap.xml'.
     limit               Optional: nur die ersten N URLs verarbeiten (Test).
     """
     product_url_re = re.compile(product_url_regex)
@@ -225,7 +238,8 @@ def fetch(base_url: str, *, sitemap_filter: str, product_url_regex: str,
         follow_redirects=True,
     ) as client:
         urls = _collect_product_urls(client, base_url, sitemap_filter,
-                                     product_url_re)
+                                     product_url_re,
+                                     sitemap_index_path=sitemap_index_path)
         if limit is not None:
             urls = urls[:limit]
         print(f"  {len(urls)} Produkt-URLs in Sitemap", file=sys.stderr)

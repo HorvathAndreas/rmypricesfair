@@ -53,12 +53,14 @@ from db import (DEFAULT_DB, get_active_competitors, get_connection, init_db,
 
 import schema_org
 import shopify
+import woocommerce
 
 # Plattform -> single-URL Fetcher. Wer hier fehlt, kann nicht manuell per URL
 # verlinkt werden (der User muesste manuell die Felder pflegen).
 SINGLE_URL_FETCHERS = {
     "schema_org": schema_org.fetch_one,
     "shopify": shopify.fetch_one,
+    "woocommerce": woocommerce.fetch_one,
 }
 
 
