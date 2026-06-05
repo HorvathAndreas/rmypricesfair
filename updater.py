@@ -29,6 +29,7 @@ from db import (DEFAULT_DB, get_active_competitors, get_confirmed_listings,
 
 import woocommerce
 import schema_org
+import shopify
 
 # Plattform -> Fetcher. Vertrag: fetch(base_url, **fetcher_config) ->
 # list[dict]. fetcher_config kommt pro Mitbewerber als JSON aus der DB und
@@ -36,6 +37,7 @@ import schema_org
 FETCHERS = {
     "woocommerce": woocommerce.fetch,
     "schema_org": schema_org.fetch,
+    "shopify": shopify.fetch,
 }
 
 MAX_CHANGES_PRINTED = 20  # nur die ersten N Preisaenderungen pro Mitbewerber zeigen

@@ -36,6 +36,7 @@ from db import (DEFAULT_DB, clear_candidates, get_active_competitors,
 
 import woocommerce
 import schema_org
+import shopify
 
 # Plattform -> Fetcher-Funktion. Vertrag: fetch(base_url, **fetcher_config) ->
 # list[dict]. Die plattformspezifischen Knoepfe stehen pro Mitbewerber als
@@ -43,6 +44,7 @@ import schema_org
 FETCHERS = {
     "woocommerce": woocommerce.fetch,
     "schema_org": schema_org.fetch,
+    "shopify": shopify.fetch,
 }
 
 # Fuzzy-Parameter
