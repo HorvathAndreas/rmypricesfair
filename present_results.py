@@ -20,6 +20,8 @@ Aufrufe:
     python present_results.py
     python present_results.py --section teurer
     python present_results.py --tol 0.05    # Toleranz fuer Preis-Match
+    python present_results.py --country DE  # nur Mitbewerber aus DE
+    python present_results.py --brand Mares  # nur Mares-Produkte
 """
 
 from __future__ import annotations
@@ -87,6 +89,7 @@ def _fetch_rows(conn, min_comp_chf: float) -> tuple[list[dict], int]:
           AND l.last_price IS NOT NULL AND v.price IS NOT NULL
           AND l.match_method != 'no-match'
           AND (l.in_stock IS NULL OR l.in_stock = 1)
+          AND (c.country_iso IS NULL OR mvp.price IS NOT NULL)
         ORDER BY v.id_product, v.id_product_attribute, c.name
         """
     ).fetchall()
@@ -123,6 +126,8 @@ def _fetch_rows(conn, min_comp_chf: float) -> tuple[list[dict], int]:
             # die Diff fuer match/teurer/guenstiger laeuft gegen DIESEN Wert,
             # nicht gegen den Header-Master-Preis.
             "my_chf": r["my_chf"],
+            "my_price": r["my_price"],
+            "my_currency": r["my_currency"],
             "my_country": r["my_country"],   # None, wenn nur Fallback genutzt
         })
     return list(by_var.values()), n_dropped
@@ -155,19 +160,24 @@ def _row_label(v: dict, width: int) -> str:
     return s
 
 
-def _fmt_comp(c: dict, tol: float) -> str:
-    """Format: 'name(LAND): comp_chf (diff)'. Diff = comp_chf - per-comp my_chf.
-    Das Laender-Tag macht sichtbar, gegen welchen Eigenpreis verglichen wird."""
-    diff = c["chf"] - c["my_chf"]
+def _fmt_comp(c: dict, tol: float, orig: bool = False) -> str:
+    """Format: 'name(LAND): preis (diff)'.
+    orig=True: Originalwaehrung (z.B. EUR), orig=False: CHF-normalisiert."""
+    diff = c["chf"] - c["my_chf"]   # immer CHF-normalisiert (vermeidet Waehrungsmix beim Fallback)
+    if orig:
+        price_str = f"{c['price']:.2f} {c['currency']}"
+    else:
+        price_str = f"{c['chf']:.2f}"
     if abs(diff) <= tol:
         marker = "="
     else:
         marker = f"{diff:+.2f}"
     tag = f"({c['country']})" if c["country"] else ""
-    return f"{c['name']}{tag}: {c['chf']:.2f} ({marker})"
+    return f"{c['name']}{tag}: {price_str} ({marker})"
 
 
-def _print_section(key: str, items: list[dict], tol: float, name_w: int = 46) -> None:
+def _print_section(key: str, items: list[dict], tol: float,
+                   name_w: int = 46, orig: bool = False) -> None:
     label = SECTION_LABELS[key]
     print()
     print(f"═══ {label} ═══  ({len(items)} Varianten)")
@@ -178,9 +188,9 @@ def _print_section(key: str, items: list[dict], tol: float, name_w: int = 46) ->
     print(f"  {'Variante':<{name_w}}  {'meiner':>10}  Mitbewerber")
     print(f"  {'-' * name_w}  {'-' * 10}  {'-' * 50}")
     for v in items:
-        comps = ", ".join(_fmt_comp(c, tol) for c in v["comps"])
+        comps = ", ".join(_fmt_comp(c, tol, orig) for c in v["comps"])
         print(f"  {_row_label(v, name_w):<{name_w}}  "
-              f"{v['my_chf']:>7.2f} CHF  {comps}")
+              f"{v['my_price']:>7.2f} {v['my_currency']}  {comps}")
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -196,6 +206,12 @@ def main(argv: list[str]) -> int:
                     help=f"Mitbewerber-Preise unter diesem CHF-Wert als "
                          f"Platzhalter werten und ignorieren "
                          f"(Default {DEFAULT_MIN_COMP_CHF})")
+    ap.add_argument("--country", metavar="ISO",
+                    help="nur Mitbewerber aus diesem Land beruecksichtigen "
+                         "(z.B. DE, CH)")
+    ap.add_argument("--brand", metavar="MARKE",
+                    help="nur Produkte dieser Marke (erstes Wort im Produktnamen, "
+                         "z.B. Mares, CETMA, Octopus)")
     args = ap.parse_args(argv[1:])
 
     conn = get_connection(args.db)
@@ -205,6 +221,29 @@ def main(argv: list[str]) -> int:
     if not items:
         print("Keine bestaetigten Listings mit aktuellem Preis vorhanden.")
         return 0
+
+    if args.brand:
+        brand = args.brand.lower()
+        items = [v for v in items if v["name"].split()[0].lower() == brand]
+        if not items:
+            print(f"Keine Produkte der Marke '{args.brand}' gefunden.")
+            return 0
+
+    if args.country:
+        country_filter = args.country.upper()
+        for v in items:
+            v["comps"] = [c for c in v["comps"]
+                          if (c["country"] or "").upper() == country_filter]
+        items = [v for v in items if v["comps"]]
+        if not items:
+            print(f"Keine Listings fuer Land '{country_filter}' gefunden.")
+            return 0
+        # Anzeigepreis auf den land-spezifischen Wert umstellen (z.B. EUR fuer DE)
+        for v in items:
+            c0 = v["comps"][0]
+            v["my_chf"] = c0["my_chf"]
+            v["my_price"] = c0["my_price"]
+            v["my_currency"] = c0["my_currency"]
 
     sections: dict[str, list[dict]] = defaultdict(list)
     for v in items:
@@ -226,15 +265,17 @@ def main(argv: list[str]) -> int:
     sections["mittelfeld"].sort(key=lambda v: v["name"])
 
     total_comps = sum(len(v["comps"]) for v in items)
+    brand_info = f", Marke: {args.brand}" if args.brand else ""
+    country_info = f", Land: {args.country.upper()}" if args.country else ""
     print(f"\n{len(items)} Varianten verglichen ueber {total_comps} Mitbewerber-Listings "
-          f"(Toleranz {args.tol:.2f} CHF).")
+          f"(Toleranz {args.tol:.2f} CHF{brand_info}{country_info}).")
     if n_dropped:
         print(f"  ({n_dropped} Mitbewerber-Listings unter {args.min_comp_price:.2f} CHF "
               f"als Platzhalter ignoriert.)")
 
     order = [args.section] if args.section else SECTION_KEYS
     for key in order:
-        _print_section(key, sections.get(key, []), args.tol)
+        _print_section(key, sections.get(key, []), args.tol, orig=bool(args.country))
 
     conn.close()
     return 0
